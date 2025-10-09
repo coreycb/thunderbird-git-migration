@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# Setup Thunderbird github repo using git-cinnabar
+# Based on: https://github.com/glandium/git-cinnabar/wiki/Mozilla:-A-git-workflow-for-Gecko-development
+
+set -euo pipefail
+IFS=$'\n\t'
+
+REPO_URL="hg::https://hg-edge.mozilla.org/comm-unified"
+TARGET_DIR="thunderbird-desktop"
+GITHUB_URL="https://github.com/thunderbird/thunderbird-desktop.git"
+
+# Behavior flags (set by CLI)
+FORCE_PUSH=false
+CLEAN=false
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS]
+
+This script migrates the Thunderbird Mercurial repository (comm-unified) to Git
+using git-cinnabar. It clones from hg, fetches specified bookmarks, creates local
+git branches, and optionally pushes them to GitHub.
+
+OPTIONS:
+  --target-dir DIR
+      Local directory name for the cloned repository.
+      Default: thunderbird-desktop
+
+  --repo-url URL
+      Mercurial repository URL (hg::...) to clone from.
+      Default: hg::https://hg-edge.mozilla.org/comm-unified
+
+  --force-push
+      Force-push to GitHub, overwriting all remote refs.
+      Deletes all existing branches and tags on remote before pushing.
+      WARNING: This is destructive and will overwrite the remote repository.
+
+  --clean
+      Clean up Mercurial and git-cinnabar artifacts after migration:
+        - Remove .hg directory
+        - Run 'git cinnabar clear' to remove cinnabar metadata
+        - Remove fetch refspecs for hg bookmarks
+        - Delete local refs under refs/heads/bookmarks/
+      WARNING: This is destructive and will delete hg history.
+
+  -h, --help
+      Show this help message and exit.
+
+WORKFLOW:
+  1. Basic migration (no push):
+    ./$(basename "$0")
+
+  2. Force-push migration (overwrite remote):
+    ./$(basename "$0") --force-push
+
+  3. Full migration with cleanup:
+    ./$(basename "$0") --force-push --clean
+
+By default the script will clone, fetch bookmarks, create local branches, and
+show suggested push commands. To actually push you must use --force-push.
+EOF
+}
+
+while [[ ${1:-} != "" ]]; do
+  case "$1" in
+    --target-dir) TARGET_DIR="$2"; shift 2;;
+    --repo-url) REPO_URL="$2"; shift 2;;
+    --force-push) FORCE_PUSH=true; shift 1;;
+    --clean) CLEAN=true; shift 1;;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown arg: $1"; usage; exit 2;;
+  esac
+done
+
+# Ensure git-cinnabar exists (try to install if cargo is available)
+if ! command -v git-cinnabar &>/dev/null; then
+  if command -v cargo &>/dev/null; then
+    echo "git-cinnabar not found, installing via 'cargo install'..."
+    cargo install --locked git-cinnabar
+    if ! command -v git-cinnabar &>/dev/null; then
+      echo "git-cinnabar still not found after cargo install. Please install manually." >&2
+      exit 1
+    fi
+  else
+    echo "git-cinnabar is required but not installed; please install it (cargo not found)." >&2
+    exit 1
+  fi
+fi
+
+# Clone if necessary
+if [ ! -d "$TARGET_DIR" ]; then
+  git clone "$REPO_URL" "$TARGET_DIR"
+elif [ -d "$TARGET_DIR/.git" ]; then
+  echo "Repository already exists and appears to be a git repo at $TARGET_DIR"
+else
+  echo "Target directory $TARGET_DIR exists but is not a git repository. Aborting." >&2
+  exit 1
+fi
+
+cd "$TARGET_DIR"
+
+# Make fetch operations prune by default
+git config fetch.prune true || true
+
+# Local git hook to make git status and friends faster
+if [ -f .git/hooks/fsmonitor-watchman.sample ]; then
+  if [ ! -e .git/hooks/query-watchman ]; then
+    echo "Installing query-watchman hook (copying sample)..."
+    cp .git/hooks/fsmonitor-watchman.sample .git/hooks/query-watchman
+    git config core.fsmonitor .git/hooks/query-watchman || true
+  else
+    echo "query-watchman hook already present, skipping"
+  fi
+fi
+
+# Bookmarks to create branches from
+BOOKMARKS=(
+  comm
+  comm-beta
+  comm-release
+  comm-esr140
+  comm-esr128
+  comm-esr115
+  comm-esr102
+  comm-esr91
+  comm-esr78
+  comm-esr68
+  comm-esr60
+  comm-esr52
+  comm-esr45
+  comm-esr38
+  comm-esr31
+  comm-esr24
+  comm-esr17
+  comm-esr10
+)
+
+# Add fetch refspecs idempotently and fetch each one
+for bookmark in "${BOOKMARKS[@]}"; do
+  branch="${bookmark#comm-}"
+  if [[ "$bookmark" == "comm" ]]; then
+    branch="main"
+  fi
+  refspec="refs/heads/bookmarks/${bookmark}:refs/remotes/origin/${branch}"
+
+  echo "Ensure fetch for ${bookmark} → origin/${branch}"
+  # Only add if it does not already exist
+  if ! git config --get-all remote.origin.fetch | grep -Fxq "$refspec"; then
+    git config --add remote.origin.fetch "$refspec"
+  else
+    echo "  fetch refspec already present, skipping"
+  fi
+
+  echo "Fetching ${bookmark}..."
+  # fetch the explicit refspec to ensure deterministic mapping from hg bookmark -> origin/${branch}
+  git fetch --no-tags origin "$refspec" || true
+done
+
+# Fetch Mercurial tags using git-cinnabar's specific command
+echo
+echo "Fetching Mercurial tags..."
+if git cinnabar fetch --tags; then
+  tag_count=$(git tag | wc -l)
+  echo "Successfully fetched ${tag_count} tags from Mercurial"
+else
+  echo "Warning: Tag fetch failed" >&2
+fi
+
+echo
+# Determine push mode based on flags
+FORCE=false
+if [ "$FORCE_PUSH" = true ]; then
+  echo "Force-push mode enabled via --force-push flag"
+  FORCE=true
+else
+  echo "No push requested: will not modify the GitHub remote."
+fi
+
+# Clean up Mercurial metadata and git-cinnabar state before changing remotes
+if [ "$CLEAN" = true ]; then
+  if [ -d .hg ]; then
+    echo "Removing .hg directory..."
+    rm -rf .hg
+  else
+    echo ".hg directory not present, skipping removal"
+  fi
+
+  echo "Clearing git-cinnabar state (if available)..."
+  # Try both invocation styles; ignore failures
+  if command -v git &>/dev/null; then
+    git cinnabar clear || true
+  fi
+  if command -v git-cinnabar &>/dev/null; then
+    git-cinnabar clear || true
+  fi
+
+  # Remove fetch refspecs that reference hg bookmark refs
+  echo "Removing fetch refspecs for bookmarks from remote.origin.fetch..."
+  git config --get-all remote.origin.fetch | grep 'refs/heads/bookmarks/' | while read -r r; do
+    echo "  Unsetting fetch refspec: $r"
+    git config --unset-all remote.origin.fetch "$r" || true
+  done || true
+
+  # Delete any local bookmark refs under refs/heads/bookmarks
+  echo "Deleting local refs under refs/heads/bookmarks/*"
+  git for-each-ref --format='%(refname)' refs/heads/bookmarks 2>/dev/null | while read -r ref; do
+    if [ -n "$ref" ]; then
+      echo "  Deleting $ref"
+      git update-ref -d "$ref" || true
+    fi
+  done || true
+else
+  echo "Cleanup (--clean) not requested; skipping removal of .hg and bookmark cleanup"
+fi
+
+# Create local branches from fetched origin/* and optionally push
+for bookmark in "${BOOKMARKS[@]}"; do
+  branch="${bookmark#comm-}"
+  if [[ "$bookmark" == "comm" ]]; then
+    branch="main"
+  fi
+
+  remote_ref="refs/remotes/origin/${branch}"
+  if git show-ref --verify --quiet "$remote_ref"; then
+    echo "Creating/updating local branch: ${branch} → ${remote_ref}"
+    git checkout -B "$branch" "origin/${branch}"
+    git status --porcelain --branch | sed -n '1p' || true
+
+    # Print a short summary (commit) for visibility
+    commit_sha="$(git rev-parse --short origin/${branch} 2>/dev/null || echo '<missing>')"
+    echo "Branch summary: ${branch} -> origin/${branch} (commit ${commit_sha})"
+  else
+    echo "origin/${branch} not found; skipping branch ${branch}"
+  fi
+done
+
+# Set origin remote URL to GitHub now that branches are created
+orig_url="$(git remote get-url origin 2>/dev/null || true)"
+git remote set-url origin "$GITHUB_URL"
+echo "Set origin remote -> $GITHUB_URL (was: ${orig_url:-<none>})"
+
+if [ "$FORCE" = true ]; then
+  echo "Preparing to force-push branches to ${GITHUB_URL}"
+
+  # Delete all existing refs (branches, tags, bookmarks, etc.) on the remote before force-pushing
+  echo "Deleting all existing refs on origin (GitHub)..."
+  git ls-remote origin | grep -v 'HEAD' | while read -r sha ref; do
+    echo "  Deleting ${ref}"
+    # Use refspec deletion (push empty ref) which works for all ref types
+  git push --quiet origin ":${ref}" 2>/dev/null || true
+  done
+
+  # Push branches
+  for bookmark in "${BOOKMARKS[@]}"; do
+    branch="${bookmark#comm-}"
+    if [[ "$bookmark" == "comm" ]]; then
+      branch="main"
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/${branch}"; then
+      echo "Force-pushing ${branch} to origin/${branch}"
+      git push --quiet --force origin "refs/heads/${branch}:refs/heads/${branch}"
+    fi
+  done
+else
+  echo "Push not requested: will not delete remote refs or push."
+  echo "Suggested branch pushes:"
+  for bookmark in "${BOOKMARKS[@]}"; do
+    branch="${bookmark#comm-}"
+    if [[ "$bookmark" == "comm" ]]; then
+      branch="main"
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/${branch}"; then
+      echo "  git push origin refs/heads/${branch}:refs/heads/${branch}"
+    fi
+  done
+fi
+
+# Push all tags to GitHub
+echo
+if [ "$FORCE" = true ]; then
+  echo "Force-pushing all tags to origin..."
+  if git push --quiet --force origin --tags; then
+    echo "Tags pushed successfully"
+  else
+    echo "Warning: Tag push failed" >&2
+  fi
+else
+  tag_count=$(git tag | wc -l)
+  echo "Suggested tag push (${tag_count} tags): git push origin --tags"
+fi
+
+echo
+echo "Thunderbird repo $TARGET_DIR setup complete!"
+echo "If you didn't force-push, run the suggested push commands above or re-run with --force-push."
