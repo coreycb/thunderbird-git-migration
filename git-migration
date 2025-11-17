@@ -30,7 +30,7 @@ OPTIONS:
       REQUIRED.
 
   --force-push
-      Force-push to GitHub, overwriting all remote refs.
+      Force-push to GitHub, overwriting all remote refs. This is currently the only way to push.
       Deletes all existing branches and tags on remote before pushing.
       WARNING: This is destructive and will overwrite the remote repository.
 
@@ -39,10 +39,10 @@ OPTIONS:
 
 WORKFLOW:
   1. Basic migration (no push):
-    ./$(basename "$0")
+    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging
 
   2. Force-push migration (overwrite remote):
-    ./$(basename "$0") --force-push
+    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --force-push
 
 By default the script will clone, fetch bookmarks, create local branches, and
 show suggested push commands. To actually push you must use --force-push.
