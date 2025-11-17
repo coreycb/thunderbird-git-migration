@@ -7,7 +7,7 @@ IFS=$'\n\t'
 
 REPO_URL="hg::https://hg-edge.mozilla.org/comm-unified"
 TARGET_DIR="thunderbird-desktop"
-GITHUB_URL="https://github.com/thunderbird/thunderbird-desktop.git"
+GITHUB_URL=""
 
 # Behavior flags (set by CLI)
 FORCE_PUSH=false
@@ -29,6 +29,10 @@ OPTIONS:
   --repo-url URL
       Mercurial repository URL (hg::...) to clone from.
       Default: hg::https://hg-edge.mozilla.org/comm-unified
+
+  --github-url URL
+      GitHub repository URL to push to.
+      REQUIRED.
 
   --force-push
       Force-push to GitHub, overwriting all remote refs.
@@ -65,12 +69,20 @@ while [[ ${1:-} != "" ]]; do
   case "$1" in
     --target-dir) TARGET_DIR="$2"; shift 2;;
     --repo-url) REPO_URL="$2"; shift 2;;
+    --github-url) GITHUB_URL="$2"; shift 2;;
     --force-push) FORCE_PUSH=true; shift 1;;
     --clean) CLEAN=true; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 2;;
   esac
 done
+
+# Validate required arguments
+if [ -z "$GITHUB_URL" ]; then
+  echo "Error: --github-url is required" >&2
+  usage
+  exit 1
+fi
 
 # Ensure git-cinnabar exists (try to install if cargo is available)
 if ! command -v git-cinnabar &>/dev/null; then
@@ -119,20 +131,6 @@ BOOKMARKS=(
   comm-beta
   comm-release
   comm-esr140
-  comm-esr128
-  comm-esr115
-  comm-esr102
-  comm-esr91
-  comm-esr78
-  comm-esr68
-  comm-esr60
-  comm-esr52
-  comm-esr45
-  comm-esr38
-  comm-esr31
-  comm-esr24
-  comm-esr17
-  comm-esr10
 )
 
 # Add fetch refspecs idempotently and fetch each one
