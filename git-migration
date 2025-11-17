@@ -5,13 +5,12 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-REPO_URL="hg::https://hg-edge.mozilla.org/comm-unified"
+HG_URL="hg::https://hg-edge.mozilla.org/comm-unified"
 TARGET_DIR="thunderbird-desktop"
 GITHUB_URL=""
 
 # Behavior flags (set by CLI)
 FORCE_PUSH=false
-CLEAN=false
 
 usage() {
   cat <<EOF
@@ -26,10 +25,6 @@ OPTIONS:
       Local directory name for the cloned repository.
       Default: thunderbird-desktop
 
-  --repo-url URL
-      Mercurial repository URL (hg::...) to clone from.
-      Default: hg::https://hg-edge.mozilla.org/comm-unified
-
   --github-url URL
       GitHub repository URL to push to.
       REQUIRED.
@@ -38,14 +33,6 @@ OPTIONS:
       Force-push to GitHub, overwriting all remote refs.
       Deletes all existing branches and tags on remote before pushing.
       WARNING: This is destructive and will overwrite the remote repository.
-
-  --clean
-      Clean up Mercurial and git-cinnabar artifacts after migration:
-        - Remove .hg directory
-        - Run 'git cinnabar clear' to remove cinnabar metadata
-        - Remove fetch refspecs for hg bookmarks
-        - Delete local refs under refs/heads/bookmarks/
-      WARNING: This is destructive and will delete hg history.
 
   -h, --help
       Show this help message and exit.
@@ -57,9 +44,6 @@ WORKFLOW:
   2. Force-push migration (overwrite remote):
     ./$(basename "$0") --force-push
 
-  3. Full migration with cleanup:
-    ./$(basename "$0") --force-push --clean
-
 By default the script will clone, fetch bookmarks, create local branches, and
 show suggested push commands. To actually push you must use --force-push.
 EOF
@@ -68,10 +52,8 @@ EOF
 while [[ ${1:-} != "" ]]; do
   case "$1" in
     --target-dir) TARGET_DIR="$2"; shift 2;;
-    --repo-url) REPO_URL="$2"; shift 2;;
     --github-url) GITHUB_URL="$2"; shift 2;;
     --force-push) FORCE_PUSH=true; shift 1;;
-    --clean) CLEAN=true; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 2;;
   esac
@@ -101,7 +83,7 @@ fi
 
 # Clone if necessary
 if [ ! -d "$TARGET_DIR" ]; then
-  git clone "$REPO_URL" "$TARGET_DIR"
+  git clone "$HG_URL" "$TARGET_DIR"
 elif [ -d "$TARGET_DIR/.git" ]; then
   echo "Repository already exists and appears to be a git repo at $TARGET_DIR"
 else
@@ -172,43 +154,6 @@ if [ "$FORCE_PUSH" = true ]; then
   FORCE=true
 else
   echo "No push requested: will not modify the GitHub remote."
-fi
-
-# Clean up Mercurial metadata and git-cinnabar state before changing remotes
-if [ "$CLEAN" = true ]; then
-  if [ -d .hg ]; then
-    echo "Removing .hg directory..."
-    rm -rf .hg
-  else
-    echo ".hg directory not present, skipping removal"
-  fi
-
-  echo "Clearing git-cinnabar state (if available)..."
-  # Try both invocation styles; ignore failures
-  if command -v git &>/dev/null; then
-    git cinnabar clear || true
-  fi
-  if command -v git-cinnabar &>/dev/null; then
-    git-cinnabar clear || true
-  fi
-
-  # Remove fetch refspecs that reference hg bookmark refs
-  echo "Removing fetch refspecs for bookmarks from remote.origin.fetch..."
-  git config --get-all remote.origin.fetch | grep 'refs/heads/bookmarks/' | while read -r r; do
-    echo "  Unsetting fetch refspec: $r"
-    git config --unset-all remote.origin.fetch "$r" || true
-  done || true
-
-  # Delete any local bookmark refs under refs/heads/bookmarks
-  echo "Deleting local refs under refs/heads/bookmarks/*"
-  git for-each-ref --format='%(refname)' refs/heads/bookmarks 2>/dev/null | while read -r ref; do
-    if [ -n "$ref" ]; then
-      echo "  Deleting $ref"
-      git update-ref -d "$ref" || true
-    fi
-  done || true
-else
-  echo "Cleanup (--clean) not requested; skipping removal of .hg and bookmark cleanup"
 fi
 
 # Create local branches from fetched origin/* and optionally push
