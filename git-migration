@@ -11,6 +11,7 @@ GITHUB_URL=""
 
 # Behavior flags (set by CLI)
 FORCE_PUSH=false
+PUSH=false
 
 usage() {
   cat <<EOF
@@ -30,9 +31,15 @@ OPTIONS:
       REQUIRED.
 
   --force-push
-      Force-push to GitHub, overwriting all remote refs. This is currently the only way to push.
+      Force-push to GitHub, overwriting all remote refs. Use this for initial
+      repository creation or to completely overwrite the existing repository.
       Deletes all existing branches and tags on remote before pushing.
       WARNING: This is destructive and will overwrite the remote repository.
+
+  --push
+      Push branches/tags to GitHub without force.
+      Intended for subsequent runs after an initial migration push.
+      Only fast-forward updates are allowed; if the remote diverged, the push will fail.
 
   -h, --help
       Show this help message and exit.
@@ -41,11 +48,14 @@ WORKFLOW:
   1. Basic migration (no push):
     ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging
 
-  2. Force-push migration (overwrite remote):
+  2. Force-push migration (overwrite remote; initial seeding / recovery):
     ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --force-push
 
+  3. Incremental push (no force; subsequent runs):
+    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --push
+
 By default the script will clone, fetch bookmarks, create local branches, and
-show suggested push commands. To actually push you must use --force-push.
+show suggested push commands.
 EOF
 }
 
@@ -53,6 +63,7 @@ while [[ ${1:-} != "" ]]; do
   case "$1" in
     --target-dir) TARGET_DIR="$2"; shift 2;;
     --github-url) GITHUB_URL="$2"; shift 2;;
+    --push) PUSH=true; shift 1;;
     --force-push) FORCE_PUSH=true; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 2;;
@@ -93,6 +104,91 @@ fi
 
 cd "$TARGET_DIR"
 
+# Ensure we keep Mercurial and GitHub as distinct remotes.
+# - `hg` is the git-cinnabar Mercurial remote (hg:: URL)
+# - `origin` is the GitHub remote
+ensure_remotes() {
+  local gh_url="$1"
+
+  local origin_url
+  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+
+  # If origin is still pointing at Mercurial, rename it to hg.
+  if [[ -n "$origin_url" && "$origin_url" == hg::* ]]; then
+    if git remote | grep -Fxq hg; then
+      # Prefer existing hg remote; just repoint origin to GitHub.
+      echo "Found Mercurial URL on origin but hg remote already exists; keeping hg as-is."
+    else
+      echo "Renaming Mercurial remote 'origin' -> 'hg'"
+      git remote rename origin hg
+      origin_url=""
+    fi
+  fi
+
+  # Ensure hg remote exists and points at HG_URL.
+  if git remote | grep -Fxq hg; then
+    git remote set-url hg "$HG_URL"
+  else
+    echo "Adding Mercurial remote 'hg' -> $HG_URL"
+    git remote add hg "$HG_URL"
+  fi
+
+  # Ensure origin remote exists and points at GitHub.
+  if git remote | grep -Fxq origin; then
+    git remote set-url origin "$gh_url"
+  else
+    echo "Adding GitHub remote 'origin' -> $gh_url"
+    git remote add origin "$gh_url"
+  fi
+}
+
+ensure_remotes "$GITHUB_URL"
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+sanity_check_branch_can_fast_forward() {
+  local branch="$1"
+
+  if ! git show-ref --verify --quiet "refs/heads/${branch}"; then
+    echo "Sanity check: Local branch refs/heads/${branch} does not exist."
+    return 0
+  fi
+
+  local remote_sha
+  remote_sha="$(git ls-remote --heads origin "refs/heads/${branch}" | awk '{print $1}')"
+  if [ -z "$remote_sha" ]; then
+    echo "Sanity check: origin/${branch} does not exist yet (will create)."
+    return 0
+  fi
+
+  echo "Sanity check: verifying ${branch} can fast-forward origin/${branch}"
+
+  # Fetch the remote branch head commit by SHA so merge-base has the object locally.
+  # This avoids updating refs/remotes/origin/<branch>, which can fail if local ref state is odd.
+  if ! git fetch --quiet --no-tags origin "${remote_sha}"; then
+    die "Failed to fetch ${remote_sha} from origin for sanity check. Remote may have rewritten history or access is misconfigured."
+  fi
+
+  if git merge-base --is-ancestor "${remote_sha}" "${branch}"; then
+    echo "Sanity check: origin/${branch} can fast-forward."
+    return 0
+  fi
+
+  # Branch can't fast-forward; determine if behind or diverged.
+  local local_sha origin_sha
+  local_sha="$(git rev-parse --short "${branch}" 2>/dev/null || echo '<missing>')"
+  origin_sha="$(git rev-parse --short "${remote_sha}" 2>/dev/null || echo '<missing>')"
+
+  if git merge-base --is-ancestor "${branch}" "${remote_sha}"; then
+    die "Refusing to push: local ${branch} (${local_sha}) is behind origin/${branch} (${origin_sha})."
+  fi
+
+  die "Refusing to push: local ${branch} (${local_sha}) and origin/${branch} (${origin_sha}) have diverged (non-fast-forward)."
+}
+
 # Make fetch operations prune by default
 git config fetch.prune true || true
 
@@ -121,19 +217,19 @@ for bookmark in "${BOOKMARKS[@]}"; do
   if [[ "$bookmark" == "comm" ]]; then
     branch="main"
   fi
-  refspec="refs/heads/bookmarks/${bookmark}:refs/remotes/origin/${branch}"
+  refspec="refs/heads/bookmarks/${bookmark}:refs/remotes/hg/${branch}"
 
-  echo "Ensure fetch for ${bookmark} → origin/${branch}"
+  echo "Ensure fetch for ${bookmark} → hg/${branch}"
   # Only add if it does not already exist
-  if ! git config --get-all remote.origin.fetch | grep -Fxq "$refspec"; then
-    git config --add remote.origin.fetch "$refspec"
+  if ! git config --get-all remote.hg.fetch | grep -Fxq "$refspec"; then
+    git config --add remote.hg.fetch "$refspec"
   else
     echo "  fetch refspec already present, skipping"
   fi
 
   echo "Fetching ${bookmark}..."
   # fetch the explicit refspec to ensure deterministic mapping from hg bookmark -> origin/${branch}
-  git fetch --no-tags origin "$refspec" || true
+  git fetch --no-tags hg "$refspec" || true
 done
 
 # Fetch Mercurial tags using git-cinnabar's specific command
@@ -152,6 +248,9 @@ FORCE=false
 if [ "$FORCE_PUSH" = true ]; then
   echo "Force-push mode enabled via --force-push flag"
   FORCE=true
+  PUSH=true
+elif [ "$PUSH" = true ]; then
+  echo "Non-force push mode enabled via --push flag"
 else
   echo "No push requested: will not modify the GitHub remote."
 fi
@@ -164,23 +263,29 @@ for bookmark in "${BOOKMARKS[@]}"; do
   fi
 
   remote_ref="refs/remotes/origin/${branch}"
-  if git show-ref --verify --quiet "$remote_ref"; then
+  # Prefer the canonical hg remote-tracking ref; fall back to older origin/* layout.
+  if git show-ref --verify --quiet "refs/remotes/hg/${branch}"; then
+    remote_ref="refs/remotes/hg/${branch}"
+  elif git show-ref --verify --quiet "refs/remotes/origin/${branch}"; then
+    remote_ref="refs/remotes/origin/${branch}"
+  else
+    remote_ref=""
+  fi
+
+  if [ -n "$remote_ref" ]; then
     echo "Creating/updating local branch: ${branch} → ${remote_ref}"
-    git checkout -B "$branch" "origin/${branch}"
+    git checkout -B "$branch" "$remote_ref"
     git status --porcelain --branch | sed -n '1p' || true
 
     # Print a short summary (commit) for visibility
-    commit_sha="$(git rev-parse --short origin/${branch} 2>/dev/null || echo '<missing>')"
-    echo "Branch summary: ${branch} -> origin/${branch} (commit ${commit_sha})"
+    commit_sha="$(git rev-parse --short "$remote_ref" 2>/dev/null || echo '<missing>')"
+    echo "Branch summary: ${branch} -> ${remote_ref} (commit ${commit_sha})"
   else
     echo "origin/${branch} not found; skipping branch ${branch}"
   fi
 done
 
-# Set origin remote URL to GitHub now that branches are created
-orig_url="$(git remote get-url origin 2>/dev/null || true)"
-git remote set-url origin "$GITHUB_URL"
-echo "Set origin remote -> $GITHUB_URL (was: ${orig_url:-<none>})"
+echo "Remotes configured: hg -> $(git remote get-url hg), origin -> $(git remote get-url origin)"
 
 if [ "$FORCE" = true ]; then
   echo "Preparing to force-push branches to ${GITHUB_URL}"
@@ -203,6 +308,28 @@ if [ "$FORCE" = true ]; then
     if git show-ref --verify --quiet "refs/heads/${branch}"; then
       echo "Force-pushing ${branch} to origin/${branch}"
       git push --quiet --force origin "refs/heads/${branch}:refs/heads/${branch}"
+    fi
+  done
+elif [ "$PUSH" = true ]; then
+  echo "Pushing branches to ${GITHUB_URL} (no force; fast-forward only)"
+  echo "Running sanity checks against origin before pushing..."
+  for bookmark in "${BOOKMARKS[@]}"; do
+    branch="${bookmark#comm-}"
+    if [[ "$bookmark" == "comm" ]]; then
+      branch="main"
+    fi
+    sanity_check_branch_can_fast_forward "$branch"
+  done
+
+  for bookmark in "${BOOKMARKS[@]}"; do
+    branch="${bookmark#comm-}"
+    if [[ "$bookmark" == "comm" ]]; then
+      branch="main"
+    fi
+
+    if git show-ref --verify --quiet "refs/heads/${branch}"; then
+      echo "Pushing ${branch} to origin/${branch}"
+      git push --quiet origin "refs/heads/${branch}:refs/heads/${branch}"
     fi
   done
 else
@@ -229,6 +356,13 @@ if [ "$FORCE" = true ]; then
   else
     echo "Warning: Tag push failed" >&2
   fi
+elif [ "$PUSH" = true ]; then
+  echo "Pushing tags to origin (no force)"
+  if git push --quiet origin --tags; then
+    echo "Tags pushed successfully"
+  else
+    echo "Warning: Tag push failed (remote may have diverged tags)" >&2
+  fi
 else
   tag_count=$(git tag | wc -l)
   echo "Suggested tag push (${tag_count} tags): git push origin --tags"
@@ -236,4 +370,10 @@ fi
 
 echo
 echo "Thunderbird repo $TARGET_DIR setup complete!"
-echo "If you didn't force-push, run the suggested push commands above or re-run with --force-push."
+if [ "$FORCE" = true ]; then
+  echo "Force-push completed. Subsequent updates can use --push (no force)."
+elif [ "$PUSH" = true ]; then
+  echo "Push completed (no force)."
+else
+  echo "No push performed. Re-run with --push (incremental) or --force-push (destructive)."
+fi
