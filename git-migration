@@ -91,7 +91,7 @@ ensure_remotes() {
   local gh_url="$1"
 
   local origin_url
-  origin_url="$(git remote get-url origin 2>/dev/null || true)"
+  origin_url="$(git remote get-url origin 2>/dev/null)" || origin_url=""
 
   # If origin is still pointing at Mercurial, rename it to hg.
   if [[ -n "$origin_url" && "$origin_url" == hg::* ]]; then
@@ -209,14 +209,14 @@ cd "$TARGET_DIR"
 ensure_remotes "$GITHUB_URL"
 
 # Make fetch operations prune by default
-git config fetch.prune true || true
+git config fetch.prune true
 
 # Local git hook to make git status and friends faster
 if [ -f .git/hooks/fsmonitor-watchman.sample ]; then
   if [ ! -e .git/hooks/query-watchman ]; then
     echo "Installing query-watchman hook (copying sample)..."
     cp .git/hooks/fsmonitor-watchman.sample .git/hooks/query-watchman
-    git config core.fsmonitor .git/hooks/query-watchman || true
+    git config core.fsmonitor .git/hooks/query-watchman
   else
     echo "query-watchman hook already present, skipping"
   fi
@@ -237,7 +237,7 @@ for bookmark in "${BOOKMARKS[@]}"; do
 
   echo "Fetching ${bookmark}..."
   # fetch the refspec to ensure mapping from hg bookmark -> origin/${branch}
-  git fetch --no-tags hg "$refspec" || true
+  git fetch --no-tags hg "$refspec"
 
   # Create local branch from the fetched remote
   if git show-ref --verify --quiet "refs/remotes/hg/${branch}"; then
@@ -277,11 +277,17 @@ if [ "$FORCE_PUSH" = true ]; then
 
   # Delete all existing refs (branches, tags, bookmarks, etc.) on the remote before force-pushing
   echo "Deleting all existing refs on origin (GitHub)..."
-  git ls-remote origin | grep -v 'HEAD' | while read -r sha ref; do
+  # Determine the default branch so we can skip it because GitHub refuses to delete it.
+  # The force-push below will overwrite it instead.
+  default_branch_ref="$(git ls-remote --symref origin HEAD | awk '/^ref:/ {print $2}')"
+  while read -r sha ref; do
+    if [[ "$ref" == "$default_branch_ref" ]]; then
+      echo "  Skipping default branch ${ref} (cannot delete; will force-push instead)"
+      continue
+    fi
     echo "  Deleting ${ref}"
-    # Use refspec deletion (push empty ref) which works for all ref types
-  git push --quiet origin ":${ref}" 2>/dev/null || true
-  done
+    git push --quiet origin ":${ref}"
+  done < <(git ls-remote origin | grep -E $'\t''refs/(heads|tags)/')
 
   # Push branches
   for bookmark in "${BOOKMARKS[@]}"; do
