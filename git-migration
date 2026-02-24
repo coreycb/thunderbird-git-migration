@@ -11,12 +11,9 @@ IFS=$'\n\t'
 HG_URL="hg::https://hg-edge.mozilla.org/comm-unified"
 TARGET_DIR=""
 GITHUB_URL=""
-CVS_HISTORY_URL="https://github.com/ehsan/mozilla-cvs-history"
-
 # Behavior flags (set by CLI)
 FORCE_PUSH=false
 PUSH=false
-INCLUDE_CVS_HISTORY=false
 
 # Bookmarks to create branches from
 BOOKMARKS=(
@@ -38,7 +35,7 @@ Usage: $(basename "$0") [OPTIONS]
 
 This script migrates the Thunderbird Mercurial repository (comm-unified) to Git
 using git-cinnabar. It clones from hg, fetches specified bookmarks, creates local
-git branches, optionally includes CVS history, and optionally pushes to GitHub.
+git branches and optionally pushes to GitHub.
 
 OPTIONS:
   --github-url URL
@@ -59,12 +56,6 @@ OPTIONS:
       Intended for subsequent runs after an initial force push.
       Only fast-forward updates are allowed; if the remote diverged, the push will fail.
 
-  --include-cvs-history
-      Include historical CVS commits from mozilla-cvs-history repository.
-      This extends the git history back to when the source was stored in CVS.
-      The script will automatically find the connection point and permanently graft the histories together.
-      CVS history will be visible to anyone who clones the repository.
-
   -h, --help
       Show this help message and exit.
 
@@ -78,8 +69,6 @@ WORKFLOW:
   3. Incremental push (no force; subsequent runs):
     ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --push
 
-  4. Include CVS history (extends git log back to CVS era):
-    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --include-cvs-history
 EOF
 }
 
@@ -163,102 +152,6 @@ ensure_branch_can_fast_forward() {
   die "Refusing to push: ${branch} cannot fast-forward origin/${branch} (branches have diverged or local is behind)"
 }
 
-integrate_cvs_history() {
-  echo
-  echo "=== Integrating CVS history ==="
-
-  # Add CVS history remote if not present
-  if ! git remote | grep -Fxq cvs-history; then
-    echo "Adding CVS history remote: $CVS_HISTORY_URL"
-    git remote add cvs-history "$CVS_HISTORY_URL"
-  else
-    echo "CVS history remote already exists"
-  fi
-
-  # Fetch CVS history
-  echo "Fetching CVS history (this may take a while)..."
-  if ! git fetch --no-tags cvs-history; then
-    die "Failed to fetch CVS history"
-  fi
-
-  # Find the latest CVS commit
-  local cvs_latest
-  cvs_latest=$(git rev-parse "cvs-history/master")
-  echo "Latest CVS commit: $(git log --oneline -1 "$cvs_latest")"
-
-  # Find all root commits across all Mercurial branches
-  echo "Finding root commits across all branches..."
-  local all_hg_branches=()
-
-  for bookmark in "${BOOKMARKS[@]}"; do
-    local branch=$(bookmark_to_branch "$bookmark")
-    if git show-ref --verify --quiet "refs/remotes/hg/${branch}"; then
-      all_hg_branches+=("refs/remotes/hg/${branch}")
-    fi
-  done
-
-  if [ ${#all_hg_branches[@]} -eq 0 ]; then
-    die "No hg branches found. Run the main migration first."
-  fi
-
-  # Get all unique root commits across all branches
-  local all_roots
-  all_roots=$(git rev-list --max-parents=0 "${all_hg_branches[@]}" | sort -u)
-
-  if [ -z "$all_roots" ]; then
-    die "Could not find any root commits in Mercurial history"
-  fi
-
-  # Count how many unique root commits we have
-  local root_count
-  root_count=$(echo "$all_roots" | wc -l)
-  echo "Found $root_count unique root commit(s) across all branches"
-
-  # Graft each root commit to CVS history
-  local grafted_count=0
-  local skipped_count=0
-
-  while read -r hg_root; do
-    # Check if there's already a graft/replace in place
-    if git replace --list | grep -q "$hg_root"; then
-      skipped_count=$((skipped_count + 1))
-      continue
-    fi
-
-    # Use git replace --graft to make this root appear as a child of cvs_latest
-    if git replace --graft "$hg_root" "$cvs_latest"; then
-      echo "  Grafted: $(git log --oneline -1 "$hg_root")"
-      grafted_count=$((grafted_count + 1))
-    else
-      die "  Failed to graft $hg_root"
-    fi
-  done <<< "$all_roots"
-
-  echo
-  echo "Summary: Created $grafted_count new graft(s), $skipped_count already existed"
-
-  if [ $grafted_count -eq 0 ] && [ $skipped_count -eq 0 ]; then
-    die "No grafts were created"
-  fi
-
-  echo "CVS history is now visible in 'git log' on all branches."
-
-  # Make the grafts permanent by rewriting history
-  if [ $grafted_count -gt 0 ]; then
-    echo
-    echo "Making CVS history grafts permanent (this may take a while)..."
-    if git filter-repo --force --partial; then
-      echo "History rewrite complete - CVS grafts are now permanent"
-
-      # Remove the replace refs since they're now baked into the commits
-      echo "Cleaning up temporary replace refs..."
-      git for-each-ref --format='delete %(refname)' refs/replace | git update-ref --stdin
-    else
-      die "git-filter-repo failed, grafts remain as replace refs"
-    fi
-  fi
-}
-
 # ============================================================================
 # Argument Parsing
 # ============================================================================
@@ -269,7 +162,6 @@ while [[ ${1:-} != "" ]]; do
     --github-url) GITHUB_URL="$2"; shift 2;;
     --push) PUSH=true; shift 1;;
     --force-push) FORCE_PUSH=true; shift 1;;
-    --include-cvs-history) INCLUDE_CVS_HISTORY=true; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 2;;
   esac
@@ -299,18 +191,6 @@ if ! command -v git-cinnabar &>/dev/null; then
     cargo install --locked git-cinnabar
   else
     die "git-cinnabar is required but not installed. Please install cargo or git-cinnabar manually."
-  fi
-fi
-
-# Ensure git-filter-repo exists if CVS history will be integrated
-if [ "$INCLUDE_CVS_HISTORY" = true ]; then
-  if ! command -v git-filter-repo &>/dev/null; then
-    if command -v apt &>/dev/null; then
-      echo "git-filter-repo not found, installing via apt..."
-      sudo apt install -y git-filter-repo
-    else
-      die "git-filter-repo is required for --include-cvs-history but not installed. Please install it manually."
-    fi
   fi
 fi
 
@@ -378,11 +258,6 @@ if git cinnabar fetch --tags; then
   echo "Successfully fetched ${tag_count} tags from Mercurial"
 else
   die "Tag fetch failed"
-fi
-
-# Integrate CVS history if requested
-if [ "$INCLUDE_CVS_HISTORY" = true ]; then
-  integrate_cvs_history
 fi
 
 # Force push or push
@@ -455,9 +330,6 @@ fi
 
 echo
 echo "Thunderbird repo $TARGET_DIR setup complete!"
-if [ "$INCLUDE_CVS_HISTORY" = true ]; then
-  echo "CVS history has been permanently integrated and will be visible to all clones."
-fi
 if [ "$FORCE_PUSH" = true ]; then
   echo "Force-push completed. Subsequent updates can use --push (no force)."
 elif [ "$PUSH" = true ]; then
