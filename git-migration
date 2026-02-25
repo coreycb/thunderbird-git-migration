@@ -14,6 +14,7 @@ GITHUB_URL=""
 # Behavior flags (set by CLI)
 FORCE_PUSH=false
 PUSH=false
+INCLUDE_CVS_HISTORY=false
 
 # Bookmarks to create branches from
 BOOKMARKS=(
@@ -24,6 +25,14 @@ BOOKMARKS=(
   comm-esr128
   comm-esr140
 )
+
+# Firefox repository and commits for CVS history grafting (--include-cvs-history).
+# TB_ROOT_COMMIT: the initial Thunderbird commit (no parents) in the converted git repo.
+# FF_ANCESTOR_COMMIT: the latest common CVS ancestor of Firefox and Thunderbird
+# These are fixed points in history and do not change across branches.
+FIREFOX_REPO_URL="https://github.com/mozilla-firefox/firefox.git"
+TB_ROOT_COMMIT="6e1d2466c28c6dfcba2dc904933289bb89ce68d3"
+FF_ANCESTOR_COMMIT="2420cef0b373cb50de7de463e5a1af09c4a8d3f3"
 
 # ============================================================================
 # Functions
@@ -56,6 +65,13 @@ OPTIONS:
       Intended for subsequent runs after an initial force push.
       Only fast-forward updates are allowed; if the remote diverged, the push will fail.
 
+  --include-cvs-history
+      Graft the common Firefox CVS history onto the Thunderbird root commit so that
+      Firefox and Thunderbird share the same ancestors with ancestors having the same
+      commit hashes.
+      WARNING: This rewrites commit SHAs that come after the CVS historical commits.
+      Use only with --force-push on the initial migration.
+
   -h, --help
       Show this help message and exit.
 
@@ -63,8 +79,8 @@ WORKFLOW:
   1. Basic migration (no push):
     ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging
 
-  2. Force-push migration (overwrite remote; initial seeding / recovery):
-    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --force-push
+  2. Force-push migration and add CVS history (overwrite remote; initial seeding / recovery):
+    ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --include-cvs-history --force-push
 
   3. Incremental push (no force; subsequent runs):
     ./$(basename "$0") --github-url https://github.com/thunderbird/thunderbird-desktop-staging --push
@@ -152,6 +168,58 @@ ensure_branch_can_fast_forward() {
   die "Refusing to push: ${branch} cannot fast-forward origin/${branch} (branches have diverged or local is behind)"
 }
 
+graft_cvs_history() {
+  echo
+  echo "=== Grafting CVS history from Firefox ==="
+
+  if ! command -v git-filter-repo &>/dev/null; then
+    if command -v apt-get &>/dev/null; then
+      echo "git-filter-repo not found, installing via apt..."
+      sudo apt-get install -y git-filter-repo
+    else
+      die "git-filter-repo is required for --include-cvs-history. Install it with: apt install git-filter-repo"
+    fi
+  fi
+
+  # Add firefox remote and fetch its full history including tags
+  if git remote | grep -Fxq firefox; then
+    git remote set-url firefox "$FIREFOX_REPO_URL"
+  else
+    git remote add firefox "$FIREFOX_REPO_URL"
+  fi
+
+  echo "Fetching Firefox history (including tags)..."
+  git fetch firefox --tags
+
+  # Verify both sides of the graft point are accessible
+  echo "Verifying graft commits..."
+  git cat-file -t "$FF_ANCESTOR_COMMIT" >/dev/null || die "Firefox ancestor commit ${FF_ANCESTOR_COMMIT} not found"
+  git cat-file -t "$TB_ROOT_COMMIT" >/dev/null || die "TB root commit ${TB_ROOT_COMMIT} not found"
+
+  # Create the graft: make FF_ANCESTOR_COMMIT the parent of TB_ROOT_COMMIT
+  echo "Creating graft: ${TB_ROOT_COMMIT} -> ${FF_ANCESTOR_COMMIT}"
+  git replace --graft "$TB_ROOT_COMMIT" "$FF_ANCESTOR_COMMIT"
+
+  echo "Active replacements:"
+  git replace -l
+
+  echo "Log around graft point:"
+  git log --pretty=format:'%h %p %s' -n 3 "$FF_ANCESTOR_COMMIT"
+  echo
+
+  git config diff.renameLimit 50000
+
+  echo "Burning grafts into history with git filter-repo (rewrites all commit SHAs)..."
+  git filter-repo --force
+
+  # filter-repo removes all remotes as a safety measure; restore them
+  git remote remove firefox 2>/dev/null || true
+  ensure_remotes "$GITHUB_URL"
+  git config fetch.prune true
+
+  echo "CVS history graft complete"
+}
+
 # ============================================================================
 # Argument Parsing
 # ============================================================================
@@ -162,6 +230,7 @@ while [[ ${1:-} != "" ]]; do
     --github-url) GITHUB_URL="$2"; shift 2;;
     --push) PUSH=true; shift 1;;
     --force-push) FORCE_PUSH=true; shift 1;;
+    --include-cvs-history) INCLUDE_CVS_HISTORY=true; shift 1;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 2;;
   esac
@@ -258,6 +327,11 @@ if git cinnabar fetch --tags; then
   echo "Successfully fetched ${tag_count} tags from Mercurial"
 else
   die "Tag fetch failed"
+fi
+
+# Graft CVS history from Firefox (one-time operation for initial migration)
+if [ "$INCLUDE_CVS_HISTORY" = true ]; then
+  graft_cvs_history
 fi
 
 # Force push or push
