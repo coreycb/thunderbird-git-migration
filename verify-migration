@@ -1,0 +1,538 @@
+#!/usr/bin/env bash
+# Verify that a git branch and its tags match the corresponding Mercurial
+# bookmark/repository.
+#
+# Works in two modes:
+#   - Cinnabar mode: if the git repo has git-cinnabar metadata (git2hg works),
+#     uses precise hash-based verification.
+#   - Content mode: falls back to comparing commit message, author email, and
+#     date — the three fields git-cinnabar preserves verbatim from hg.
+#
+# Usage: ./verify-migration [OPTIONS] <git-repo-path> <branch-name> <hg-repo-path>
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ============================================================================
+# Defaults
+# ============================================================================
+
+SAMPLE_SIZE=5       # commits to check at head and tail of history
+TAG_SAMPLE=20       # tags to deep-verify (commit-level)
+CHECK_COUNT=false   # commit-count check is opt-in (can be slow on large repos)
+ALL_TAG_DIFFS=false # show all tag differences (not just a sample)
+HG_REV=""           # override the hg revision expression (default: auto-detect)
+CVS_HISTORY=false   # set when CVS history was grafted via --include-cvs-history
+# Default FF ancestor matches git-migration's FF_ANCESTOR_COMMIT constant.
+# Override with --ff-ancestor if a different graft point was used.
+FF_ANCESTOR="2420cef0b373cb50de7de463e5a1af09c4a8d3f3"
+
+# ============================================================================
+# Output helpers
+# ============================================================================
+
+PASS=0; FAIL=0; WARN=0
+
+pass() { echo "  [PASS] $*"; PASS=$((PASS + 1)); }
+fail() { echo "  [FAIL] $*" >&2; FAIL=$((FAIL + 1)); }
+warn() { echo "  [WARN] $*"; WARN=$((WARN + 1)); }
+info() { echo "        $*"; }
+section() { echo; echo "=== $* ==="; }
+
+# ============================================================================
+# Branch -> bookmark mapping
+# ============================================================================
+
+branch_to_bookmark() {
+  case "$1" in
+    main) echo "comm" ;;
+    *)    echo "comm-$1" ;;
+  esac
+}
+
+# ============================================================================
+# Usage
+# ============================================================================
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [OPTIONS] <git-repo-path> <branch-name> <hg-repo-path>
+
+Verifies that a git branch matches the corresponding Mercurial bookmark.
+Compares tip commits, a sample of history, and tags.
+
+ARGS:
+  git-repo-path   Path to the local git repository
+  branch-name     Git branch to verify (e.g., main, esr140, beta, release)
+  hg-repo-path    Path to the local Mercurial repository
+
+OPTIONS:
+  --sample N      Commits to sample at head and tail of history (default: $SAMPLE_SIZE)
+  --tag-sample N  Number of tags to deep-verify at commit level (default: $TAG_SAMPLE)
+  --hg-rev REV    Hg revision expression to use as the branch tip instead of
+                  auto-detected bookmark (e.g., tip, default, a specific node).
+                  Useful for standalone repos (comm-esr140) that have no bookmark.
+  --count         Also verify total commit count (may be slow on large repos)
+  --all-tag-diffs Show all missing/extra tags instead of a summary
+  --cvs-history   Indicate that Firefox CVS history was grafted onto the repo
+                  via --include-cvs-history. Adjusts oldest-commit sampling to
+                  skip pre-Thunderbird CVS commits, tweaks commit-count checks,
+                  and adds a CVS graft verification section.
+  --ff-ancestor SHA
+                  The Firefox ancestor commit SHA used as the graft point
+                  (default: $FF_ANCESTOR). Only needed with --cvs-history.
+  -h, --help      Show this help and exit
+
+NOTES:
+  For comm-unified repos, the bookmark is auto-derived from the branch name
+  (e.g., esr140 -> comm-esr140, main -> comm). For standalone repos that have
+  no bookmark (e.g., a plain comm-esr140 clone), use --hg-rev tip or
+  --hg-rev default to compare against the repo tip.
+
+EXAMPLES:
+  $(basename "$0") ./thunderbird-desktop main   ~/src/thunderbird/comm-unified
+  $(basename "$0") ./thunderbird-desktop main   ~/src/thunderbird/comm-unified --cvs-history
+  $(basename "$0") ./thunderbird-desktop beta ~/src/thunderbird/comm-unified --count --sample 10
+  $(basename "$0") ./thunderbird-desktop esr140 ~/src/thunderbird/comm-esr140 --hg-rev tip
+EOF
+}
+
+# ============================================================================
+# Argument parsing
+# ============================================================================
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --sample)        SAMPLE_SIZE="$2"; shift 2 ;;
+    --tag-sample)    TAG_SAMPLE="$2";  shift 2 ;;
+    --hg-rev)        HG_REV="$2";      shift 2 ;;
+    --count)         CHECK_COUNT=true;    shift 1 ;;
+    --all-tag-diffs) ALL_TAG_DIFFS=true;  shift 1 ;;
+    --cvs-history)   CVS_HISTORY=true;    shift 1 ;;
+    --ff-ancestor)   FF_ANCESTOR="$2";    shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)  POSITIONAL+=("$1"); shift 1 ;;
+  esac
+done
+
+if [[ ${#POSITIONAL[@]} -ne 3 ]]; then
+  usage >&2
+  exit 1
+fi
+
+GIT_REPO="${POSITIONAL[0]}"
+BRANCH="${POSITIONAL[1]}"
+HG_REPO="${POSITIONAL[2]}"
+HG_BOOKMARK=$(branch_to_bookmark "$BRANCH")
+# HG_TIP_REV is the hg revision expression used to identify the branch tip.
+# It may be a bookmark name, "tip", "default", or a user-supplied value.
+HG_TIP_REV=""
+
+# ============================================================================
+# Dependency / path checks
+# ============================================================================
+
+[[ -d "$GIT_REPO/.git" ]] || { echo "Error: '$GIT_REPO' is not a git repository" >&2; exit 1; }
+[[ -d "$HG_REPO/.hg"  ]] || { echo "Error: '$HG_REPO' is not a Mercurial repository" >&2; exit 1; }
+
+for cmd in git hg; do
+  command -v "$cmd" &>/dev/null || { echo "Error: '$cmd' not found in PATH" >&2; exit 1; }
+done
+
+# Detect cinnabar mode: git2hg returns a non-null hash for a known commit
+USE_CINNABAR=false
+if command -v git-cinnabar &>/dev/null || git -C "$GIT_REPO" cinnabar --version &>/dev/null 2>&1; then
+  _test_hash=$(git -C "$GIT_REPO" log -1 --format="%H" "$BRANCH" 2>/dev/null || true)
+  if [[ -n "$_test_hash" ]]; then
+    _hg_hash=$(git -C "$GIT_REPO" cinnabar git2hg "$_test_hash" 2>/dev/null || true)
+    if [[ -n "$_hg_hash" && "$_hg_hash" != "0000000000000000000000000000000000000000" ]]; then
+      USE_CINNABAR=true
+    fi
+  fi
+fi
+
+echo "Verifying git '$BRANCH' against hg '$HG_BOOKMARK'"
+echo "  Git repo   : $GIT_REPO"
+echo "  Hg repo    : $HG_REPO"
+echo "  Mode       : $( $USE_CINNABAR && echo "cinnabar (hash-based)" || echo "content (message/author/date)" )"
+if $CVS_HISTORY; then
+  echo "  CVS history: yes (FF ancestor ${FF_ANCESTOR:0:12})"
+fi
+
+# ============================================================================
+# Helper: get a git commit's fingerprint for content comparison
+# Returns "<author_email>|<iso_date>|<subject>"
+# ============================================================================
+
+git_fingerprint() {
+  local meta first_line
+  meta=$(git -C "$GIT_REPO" log -1 --format="%ae|%ad" --date=format:"%Y-%m-%d %H:%M:%S %z" "$1")
+  # Use %B (full body) + head -1 to match hg's {desc|firstline} behaviour:
+  # both stop at the first newline, not the first blank line.
+  first_line=$(git -C "$GIT_REPO" log -1 --format="%B" "$1" | head -1)
+  echo "$meta|$first_line"
+}
+
+# Helper: get an hg changeset's fingerprint
+# $1 = hg revision expression (node, bookmark, rev number, etc.)
+hg_fingerprint() {
+  hg -R "$HG_REPO" log -r "$1" \
+     --template "{author|email}|{date|isodatesec}|{desc|firstline}\n" 2>/dev/null || echo ""
+}
+
+# ============================================================================
+# 1. Branch / bookmark / rev existence
+# ============================================================================
+
+section "Branch / revision existence"
+
+if git -C "$GIT_REPO" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+  pass "Git branch 'refs/heads/$BRANCH' exists"
+else
+  fail "Git branch 'refs/heads/$BRANCH' does not exist"
+  exit 1
+fi
+
+# Resolve which hg revision to use as the branch tip:
+#   Priority: --hg-rev flag > bookmark name > "default" branch > "tip"
+if [[ -n "$HG_REV" ]]; then
+  # User-supplied: just verify it resolves
+  if hg -R "$HG_REPO" log -r "$HG_REV" --template "" &>/dev/null; then
+    HG_TIP_REV="$HG_REV"
+    pass "Hg revision '$HG_TIP_REV' resolves (user-supplied via --hg-rev)"
+  else
+    fail "Hg revision '$HG_REV' does not resolve in $HG_REPO"
+    exit 1
+  fi
+elif hg -R "$HG_REPO" bookmarks 2>/dev/null | grep -qE "^ *$HG_BOOKMARK[ *]"; then
+  HG_TIP_REV="$HG_BOOKMARK"
+  pass "Hg bookmark '$HG_TIP_REV' exists"
+else
+  # Standalone repo (no bookmark) — fall back to default branch or tip
+  info "Bookmark '$HG_BOOKMARK' not found; trying 'default' branch..."
+  if hg -R "$HG_REPO" log -r "default" --template "" &>/dev/null 2>&1; then
+    HG_TIP_REV="default"
+    warn "Bookmark '$HG_BOOKMARK' not found; using 'default' branch tip instead"
+  else
+    HG_TIP_REV="tip"
+    warn "Bookmark '$HG_BOOKMARK' not found; using 'tip' instead (pass --hg-rev to override)"
+  fi
+fi
+echo "  Using hg revision: $HG_TIP_REV"
+
+# ============================================================================
+# 2. Tip commit
+# ============================================================================
+
+section "Tip commit"
+
+GIT_TIP=$(git -C "$GIT_REPO" rev-parse "$BRANCH")
+
+if $USE_CINNABAR; then
+  GIT_TIP_AS_HG=$(git -C "$GIT_REPO" cinnabar git2hg "$GIT_TIP")
+  HG_TIP=$(hg -R "$HG_REPO" log -r "$HG_TIP_REV" --template "{node}\n")
+  info "Git tip         : ${GIT_TIP:0:12}"
+  info "Git tip -> hg   : ${GIT_TIP_AS_HG:0:12}"
+  info "Hg tip ($HG_TIP_REV) : ${HG_TIP:0:12}"
+  if [[ "$GIT_TIP_AS_HG" == "$HG_TIP" ]]; then
+    pass "Tip commit matches (hash)"
+  else
+    fail "Tip commit MISMATCH (git tip maps to hg ${GIT_TIP_AS_HG:0:12}, hg tip is ${HG_TIP:0:12})"
+  fi
+else
+  GIT_FP=$(git_fingerprint "$GIT_TIP")
+  HG_FP=$(hg_fingerprint "$HG_TIP_REV")
+  info "Git tip fp : $GIT_FP"
+  info "Hg  tip fp : $HG_FP"
+  if [[ "$GIT_FP" == "$HG_FP" ]]; then
+    pass "Tip commit matches (author/date/message)"
+  else
+    fail "Tip commit MISMATCH"
+    info "  git: $GIT_FP"
+    info "  hg:  $HG_FP"
+  fi
+fi
+
+# ============================================================================
+# 3. Commit count (opt-in: --count)
+# ============================================================================
+
+if $CHECK_COUNT; then
+  section "Commit count (this may be slow)"
+  GIT_COUNT=$(git -C "$GIT_REPO" rev-list --count "$BRANCH")
+  HG_COUNT=$(hg -R "$HG_REPO" log -r "::$HG_TIP_REV" --template "x\n" 2>/dev/null | wc -l)
+  info "Git commits : $GIT_COUNT"
+  info "Hg commits  : $HG_COUNT"
+  if $CVS_HISTORY; then
+    # With CVS history grafted, the git repo contains Firefox CVS commits that
+    # predate Thunderbird. Count only the Thunderbird-specific commits for comparison.
+    if git -C "$GIT_REPO" cat-file -t "$FF_ANCESTOR" &>/dev/null; then
+      CVS_COUNT=$(git -C "$GIT_REPO" rev-list --count "$FF_ANCESTOR")
+      TB_GIT_COUNT=$(( GIT_COUNT - CVS_COUNT ))
+      info "CVS commits prepended : $CVS_COUNT"
+      info "TB-only git commits   : $TB_GIT_COUNT"
+      if [[ "$TB_GIT_COUNT" -eq "$HG_COUNT" ]]; then
+        pass "Thunderbird commit count matches hg ($TB_GIT_COUNT)"
+      else
+        fail "Commit count MISMATCH (TB-only git: $TB_GIT_COUNT, hg: $HG_COUNT)"
+      fi
+    else
+      warn "FF ancestor ${FF_ANCESTOR:0:12} not found in git repo; skipping count adjustment"
+      info "Raw git vs hg: $GIT_COUNT vs $HG_COUNT (git will be higher with CVS history)"
+    fi
+  else
+    if [[ "$GIT_COUNT" -eq "$HG_COUNT" ]]; then
+      pass "Commit count matches ($GIT_COUNT)"
+    else
+      fail "Commit count MISMATCH (git: $GIT_COUNT, hg: $HG_COUNT)"
+    fi
+  fi
+fi
+
+# ============================================================================
+# 4. Commit sample
+# ============================================================================
+
+section "Commit sample (newest $SAMPLE_SIZE + oldest $SAMPLE_SIZE)"
+
+verify_git_commit() {
+  local git_hash="$1"
+  local label="$2"  # "newest" or "oldest"
+
+  if $USE_CINNABAR; then
+    local hg_hash
+    hg_hash=$(git -C "$GIT_REPO" cinnabar git2hg "$git_hash")
+    if [[ -z "$hg_hash" || "$hg_hash" == "0000000000000000000000000000000000000000" ]]; then
+      fail "$label git ${git_hash:0:12}: no hg mapping (git2hg returned null)"
+      return
+    fi
+    if hg -R "$HG_REPO" log -r "$hg_hash" --template "" &>/dev/null; then
+      local subj
+      subj=$(git -C "$GIT_REPO" log -1 --format="%s" "$git_hash")
+      pass "$label git ${git_hash:0:12} -> hg ${hg_hash:0:12}  (${subj:0:60})"
+    else
+      fail "$label git ${git_hash:0:12} -> hg ${hg_hash:0:12}: changeset not found in hg repo"
+    fi
+  else
+    local git_fp hg_node hg_fp
+    git_fp=$(git_fingerprint "$git_hash")
+    # Extract fields to search in hg: use author email + date as the lookup key
+    local git_email git_date git_subj
+    IFS='|' read -r git_email git_date git_subj <<< "$git_fp"
+    # Locate matching hg changeset by author email + date (fast: index on date not needed but usually unique)
+    hg_node=$(hg -R "$HG_REPO" log \
+      -r "date('$git_date') and author('$git_email')" \
+      --template "{node}\n" 2>/dev/null | head -1 || true)
+    if [[ -n "$hg_node" ]]; then
+      hg_fp=$(hg_fingerprint "$hg_node")
+      if [[ "$git_fp" == "$hg_fp" ]]; then
+        pass "$label git ${git_hash:0:12} -> hg ${hg_node:0:12}  (${git_subj:0:60})"
+      else
+        warn "$label git ${git_hash:0:12}: found matching hg commit but subject differs"
+        info "  git: $git_fp"
+        info "  hg:  $hg_fp"
+      fi
+    else
+      fail "$label git ${git_hash:0:12}: no matching hg changeset (author=$git_email date=$git_date)"
+    fi
+  fi
+}
+
+echo "  Newest $SAMPLE_SIZE commits:"
+while IFS= read -r h; do
+  verify_git_commit "$h" "newest"
+done < <(git -C "$GIT_REPO" log "$BRANCH" --format="%H" | head -"$SAMPLE_SIZE")
+
+echo "  Oldest $SAMPLE_SIZE commits:"
+if $CVS_HISTORY; then
+  # Oldest commits are Firefox CVS history with no hg counterpart.
+  # Sample the oldest Thunderbird-specific commits instead (those after the FF ancestor).
+  if git -C "$GIT_REPO" cat-file -t "$FF_ANCESTOR" &>/dev/null; then
+    info "(CVS history mode: sampling oldest Thunderbird-specific commits after ${FF_ANCESTOR:0:12})"
+    while IFS= read -r h; do
+      verify_git_commit "$h" "oldest"
+    done < <(git -C "$GIT_REPO" log --reverse --ancestry-path "${FF_ANCESTOR}..${BRANCH}" --format="%H" | head -"$SAMPLE_SIZE")
+  else
+    warn "FF ancestor ${FF_ANCESTOR:0:12} not found in git repo; skipping oldest-commit sample"
+  fi
+else
+  while IFS= read -r h; do
+    verify_git_commit "$h" "oldest"
+  done < <(git -C "$GIT_REPO" log "$BRANCH" --reverse --format="%H" | head -"$SAMPLE_SIZE")
+fi
+
+# ============================================================================
+# 5. CVS graft verification (only when --cvs-history is set)
+# ============================================================================
+
+if $CVS_HISTORY; then
+  section "CVS graft verification"
+
+  if git -C "$GIT_REPO" cat-file -t "$FF_ANCESTOR" &>/dev/null; then
+    pass "FF ancestor commit ${FF_ANCESTOR:0:12} exists in git repo"
+  else
+    fail "FF ancestor commit ${FF_ANCESTOR:0:12} not found in git repo"
+  fi
+
+  if git -C "$GIT_REPO" merge-base --is-ancestor "$FF_ANCESTOR" "$BRANCH" 2>/dev/null; then
+    pass "FF ancestor ${FF_ANCESTOR:0:12} is an ancestor of $BRANCH"
+  else
+    fail "FF ancestor ${FF_ANCESTOR:0:12} is NOT an ancestor of $BRANCH (graft may be missing)"
+  fi
+
+  # Verify there are Thunderbird-specific commits after the graft point
+  TB_AFTER=$(git -C "$GIT_REPO" rev-list --count --ancestry-path "${FF_ANCESTOR}..${BRANCH}" 2>/dev/null || echo 0)
+  if [[ "$TB_AFTER" -gt 0 ]]; then
+    pass "$TB_AFTER Thunderbird-specific commits found after graft point"
+  else
+    fail "No Thunderbird-specific commits found after graft point ${FF_ANCESTOR:0:12}"
+  fi
+fi
+
+# ============================================================================
+# 6. Tag verification
+# ============================================================================
+
+section "Tag verification"
+
+# Load all hg tags into an associative array: name -> hg node
+declare -A HG_TAGS
+while IFS=' ' read -r tag_name hg_node; do
+  [[ "$tag_name" == "tip" ]] && continue
+  HG_TAGS["$tag_name"]="$hg_node"
+done < <(hg -R "$HG_REPO" tags --template "{tag} {node}\n" 2>/dev/null)
+
+# Collect git tags
+mapfile -t GIT_TAGS < <(git -C "$GIT_REPO" tag)
+
+info "Git tags : ${#GIT_TAGS[@]}"
+info "Hg tags  : ${#HG_TAGS[@]}"
+
+# 5a. Check which hg tags are present/missing in git; build a list of common tags
+MISSING_IN_GIT=()
+COMMON_TAGS=()
+for tag in "${!HG_TAGS[@]}"; do
+  if git -C "$GIT_REPO" rev-parse --verify "refs/tags/$tag" &>/dev/null; then
+    COMMON_TAGS+=("$tag")
+  else
+    MISSING_IN_GIT+=("$tag")
+  fi
+done
+
+if [[ ${#MISSING_IN_GIT[@]} -eq 0 ]]; then
+  pass "All ${#HG_TAGS[@]} hg tags are present in git"
+else
+  warn "${#MISSING_IN_GIT[@]} hg tags not found in git (may be from excluded branches)"
+  if $ALL_TAG_DIFFS; then
+    mapfile -t SORTED_MISSING < <(printf '%s\n' "${MISSING_IN_GIT[@]}" | sort)
+    for t in "${SORTED_MISSING[@]}"; do
+      info "  missing in git: $t"
+    done
+  else
+    SHOW=$(( ${#MISSING_IN_GIT[@]} < 5 ? ${#MISSING_IN_GIT[@]} : 5 ))
+    for (( i=0; i<SHOW; i++ )); do
+      info "  e.g. missing: ${MISSING_IN_GIT[$i]}"
+    done
+    [[ ${#MISSING_IN_GIT[@]} -gt 5 ]] && info "  ... (${#MISSING_IN_GIT[@]} total missing; use --all-tag-diffs to list all)"
+  fi
+fi
+
+# 5b. Warn about git tags with no hg counterpart (expected for git-only or migrated-only tags)
+EXTRA_IN_GIT=()
+for tag in "${GIT_TAGS[@]}"; do
+  [[ -v HG_TAGS["$tag"] ]] || EXTRA_IN_GIT+=("$tag")
+done
+if [[ ${#EXTRA_IN_GIT[@]} -gt 0 ]]; then
+  info "${#EXTRA_IN_GIT[@]} git tags have no corresponding hg tag (may be expected)"
+  if $ALL_TAG_DIFFS; then
+    mapfile -t SORTED_EXTRA < <(printf '%s\n' "${EXTRA_IN_GIT[@]}" | sort)
+    for t in "${SORTED_EXTRA[@]}"; do
+      info "  extra in git: $t"
+    done
+  fi
+fi
+
+# 5c. Deep-verify a sample of tags that exist in BOTH git and hg
+# Only sample from COMMON_TAGS to avoid noisy failures for expected gaps.
+# Sample evenly across the sorted list.
+mapfile -t SORTED_COMMON < <(printf '%s\n' "${COMMON_TAGS[@]:-}" | sort)
+TOTAL=${#SORTED_COMMON[@]}
+
+SAMPLE_TAGS=()
+if [[ $TOTAL -le $TAG_SAMPLE ]]; then
+  SAMPLE_TAGS=("${SORTED_COMMON[@]:-}")
+elif [[ $TOTAL -gt 0 ]]; then
+  STEP=$(( TOTAL / TAG_SAMPLE ))
+  [[ $STEP -lt 1 ]] && STEP=1
+  for (( i=0; i<TOTAL && ${#SAMPLE_TAGS[@]}<TAG_SAMPLE; i+=STEP )); do
+    SAMPLE_TAGS+=("${SORTED_COMMON[$i]}")
+  done
+fi
+
+echo "  Deep-verifying ${#SAMPLE_TAGS[@]} sampled tags (from ${#COMMON_TAGS[@]} common tags)..."
+TAG_OK=0; TAG_BAD=0; TAG_SKIP=0
+
+for tag in "${SAMPLE_TAGS[@]:-}"; do
+  [[ -v HG_TAGS["$tag"] ]] || continue
+  hg_node="${HG_TAGS[$tag]}"
+
+  # Resolve the git tag to a commit (dereference annotated tags)
+  git_commit=$(git -C "$GIT_REPO" rev-parse "refs/tags/$tag^{}" 2>/dev/null \
+             || git -C "$GIT_REPO" rev-parse "refs/tags/$tag"   2>/dev/null \
+             || true)
+  if [[ -z "$git_commit" ]]; then
+    fail "Tag '$tag': cannot resolve git commit"
+    TAG_BAD=$((TAG_BAD + 1))
+    continue
+  fi
+
+  if $USE_CINNABAR; then
+    git_as_hg=$(git -C "$GIT_REPO" cinnabar git2hg "$git_commit" 2>/dev/null || true)
+    if [[ "$git_as_hg" == "$hg_node" ]]; then
+      TAG_OK=$((TAG_OK + 1))
+    else
+      fail "Tag '$tag': git points to hg ${git_as_hg:0:12}, expected ${hg_node:0:12}"
+      TAG_BAD=$((TAG_BAD + 1))
+    fi
+  else
+    git_fp=$(git_fingerprint "$git_commit")
+    # hg_fingerprint returns "" if node can't be resolved locally
+    hg_fp=$(hg_fingerprint "$hg_node")
+    if [[ -z "$hg_fp" ]]; then
+      TAG_SKIP=$((TAG_SKIP + 1))
+      continue
+    fi
+    if [[ "$git_fp" == "$hg_fp" ]]; then
+      TAG_OK=$((TAG_OK + 1))
+    else
+      fail "Tag '$tag': tagged commit metadata mismatch"
+      info "  git: $git_fp"
+      info "  hg:  $hg_fp"
+      TAG_BAD=$((TAG_BAD + 1))
+    fi
+  fi
+done
+
+[[ $TAG_OK   -gt 0 ]] && pass "$TAG_OK sampled tags verified at commit level"
+[[ $TAG_SKIP -gt 0 ]] && warn "$TAG_SKIP sampled tags skipped (hg node not resolvable locally)"
+[[ $TAG_BAD  -gt 0 ]] || true  # already counted via fail()
+
+# ============================================================================
+# Summary
+# ============================================================================
+
+section "Summary"
+printf "  %-8s %d\n" "PASS:" "$PASS"
+printf "  %-8s %d\n" "WARN:" "$WARN"
+printf "  %-8s %d\n" "FAIL:" "$FAIL"
+echo
+
+if [[ $FAIL -gt 0 ]]; then
+  echo "VERIFICATION FAILED ($FAIL failure(s))"
+  exit 1
+else
+  echo "VERIFICATION PASSED"
+  exit 0
+fi
