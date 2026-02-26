@@ -1,0 +1,39 @@
+#!/bin/bash
+#
+# This was used for the final update in response to:
+# https://bugzilla.mozilla.org/show_bug.cgi?id=2012573#c23
+#
+set -euo pipefail
+
+git clone https://github.com/thunderbird/infra-testing
+cd infra-testing
+
+git -c cinnabar.graft=true fetch --tags hg::https://hg.mozilla.org/comm-unified/
+
+git remote add comm hg::https://hg.mozilla.org/comm-unified/
+git config remote.comm.cinnabar-refs bookmarks
+git fetch comm
+
+git branch --all
+
+branches=(main beta release esr140 esr128 esr115)
+
+for b in "${branches[@]}"; do
+  git checkout "$b"
+
+  if [[ "$b" == "main" ]]; then
+    git rebase remotes/comm/comm
+  else
+    git merge --ff-only "remotes/comm/comm-$b"
+  fi
+done
+
+git remote remove comm
+
+echo
+echo "Now run on each branch to verify hg metadata:"
+echo "  git log --notes=cinnabar"
+echo "  git log --notes=cinnabar a5e1b64 -2"
+echo
+echo "And then:"
+echo "  git push --all --tags"
