@@ -188,8 +188,8 @@ graft_cvs_history() {
     git remote add firefox "$FIREFOX_REPO_URL"
   fi
 
-  echo "Fetching Firefox history (including tags)..."
-  git fetch firefox --tags
+  echo "Fetching Firefox history..."
+  git fetch firefox --no-tags
 
   # Verify both sides of the graft point are accessible
   echo "Verifying graft commits..."
