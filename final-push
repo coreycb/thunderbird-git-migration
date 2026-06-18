@@ -5,14 +5,19 @@
 #
 set -euo pipefail
 
-git clone https://github.com/thunderbird/infra-testing
-cd infra-testing
-
-git -c cinnabar.graft=true fetch --tags hg::https://hg.mozilla.org/comm-unified/
+#git clone https://github.com/thunderbird/infra-testing
+#cd infra-testing
+git clone https://github.com/thunderbird/thunderbird-desktop
+cd thunderbird-desktop
 
 git remote add comm hg::https://hg.mozilla.org/comm-unified/
 git config remote.comm.cinnabar-refs bookmarks
 git fetch comm
+
+# Fetch Mercurial tags. A plain "git fetch --tags hg::URL" does NOT surface hg
+# tags through git-cinnabar; only "git cinnabar fetch --tags" materializes them
+# into refs/tags/. Run after fetching comm so the commits the tags point to exist.
+git cinnabar fetch --tags
 
 git branch --all
 
