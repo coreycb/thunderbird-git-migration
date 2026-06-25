@@ -18,12 +18,13 @@ INCLUDE_CVS_HISTORY=false
 
 # Bookmarks to create branches from
 BOOKMARKS=(
-  comm
-  comm-beta
-  comm-release
-  comm-esr115
-  comm-esr128
-  comm-esr140
+  #comm
+  #comm-beta
+  #comm-release
+  #comm-esr115
+  #comm-esr128
+  #comm-esr140
+  comm-esr153
 )
 
 # Firefox repository and commits for CVS history grafting (--include-cvs-history).

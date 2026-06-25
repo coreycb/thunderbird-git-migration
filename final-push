@@ -7,7 +7,7 @@ set -euo pipefail
 
 #git clone https://github.com/thunderbird/infra-testing
 #cd infra-testing
-git clone https://github.com/thunderbird/thunderbird-desktop
+#git clone https://github.com/thunderbird/thunderbird-desktop
 cd thunderbird-desktop
 
 git remote add comm hg::https://hg.mozilla.org/comm-unified/
@@ -21,7 +21,7 @@ git cinnabar fetch --tags
 
 git branch --all
 
-branches=(main beta release esr140 esr128 esr115)
+branches=(main beta release esr153 esr140 esr128 esr115)
 
 for b in "${branches[@]}"; do
   git checkout "$b"
